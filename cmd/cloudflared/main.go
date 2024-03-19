@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"github.com/joho/godotenv"
 	"math/rand"
 	"os"
 	"strings"
@@ -52,7 +53,10 @@ var (
 func main() {
 	// FIXME: TUN-8148: Disable QUIC_GO ECN due to bugs in proper detection if supported
 	os.Setenv("QUIC_GO_DISABLE_ECN", "1")
-
+	err := godotenv.Load()
+	if err != nil {
+		fmt.Println("Can't find .env")
+	}
 	rand.Seed(time.Now().UnixNano())
 	metrics.RegisterBuildInfo(BuildType, BuildTime, Version)
 	maxprocs.Set()

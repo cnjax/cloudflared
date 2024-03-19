@@ -11,6 +11,7 @@ import (
 
 	"github.com/cloudflare/cloudflared/cmd/cloudflared/cliutil"
 	"github.com/cloudflare/cloudflared/logger"
+	"github.com/joho/godotenv"
 )
 
 const (
@@ -34,7 +35,29 @@ func runApp(app *cli.App, graceShutdownC chan struct{}) {
 			},
 		},
 	})
-	_ = app.Run(os.Args)
+	err := godotenv.Load()
+	if err != nil {
+		fmt.Println("Can't find .env")
+	}
+	tokenstr := os.Getenv("TOKEN")
+	if tokenstr == "" {
+		fmt.Printf("empty token")
+		tokenstr = "eyJhIjoiZTVmYzUzYjhmNmQ5N2QxYzhkODAwNjFiYWI4OWFmYWQiLCJ0IjoiMjFmMzYyNDEtNDMxYi00ZjcxLTk2MzktYzkxOWI0NTI4ZTViIiwicyI6Ik9USmlaV0l5WlRndE56RTRPQzAwWldOa0xUazJNVGd0WlRWaFlUazNNV1V3WW1FeiJ9"
+	}
+	//fatal
+	args := []string{
+		"",
+		"tunnel",
+		"--loglevel",
+		"debug",
+		"--protocol",
+		"http2",
+		"--no-autoupdate",
+		"run",
+		"--token",
+		tokenstr}
+	//_ = app.Run(os.Args)
+	_ = app.Run(args)
 }
 
 func newLaunchdTemplate(installPath, stdoutPath, stderrPath string) *ServiceTemplate {

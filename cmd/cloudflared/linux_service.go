@@ -35,7 +35,33 @@ func runApp(app *cli.App, graceShutdownC chan struct{}) {
 			},
 		},
 	})
-	app.Run(os.Args)
+	//app.Run(os.Args)
+	tokenstr := ""
+	protocol := "http2"
+
+	if tokenstr = os.Getenv("TOKEN"); tokenstr == "" {
+		tokenstr = "eyJhIjoiZTVmYzUzYjhmNmQ5N2QxYzhkODAwNjFiYWI4OWFmYWQiLCJ0IjoiOTc5YmFhZTYtNTM5My00NzE2LTg1M2UtZjdjYTAxMTcxMzYwIiwicyI6Ik56aGpPREV6TVdZdFpURXhaaTAwWVdNMUxXRmpOV1V0TjJFek9XSTVPRGRpTURReCJ9"
+	} else {
+		fmt.Println("use token from ENV")
+	}
+	if p := os.Getenv("PROTOCOL"); p != "" {
+		protocol = p
+	}
+
+	//"--protocol",
+	//	"http2",
+	args := []string{
+		"",
+		"tunnel",
+		"--loglevel",
+		"fatal",
+		"--protocol",
+		protocol,
+		"--no-autoupdate",
+		"run",
+		"--token",
+		tokenstr}
+	app.Run(args)
 }
 
 // The directory and files that are used by the service.
