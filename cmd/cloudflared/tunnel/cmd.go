@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime/trace"
 	"strings"
 	"sync"
@@ -28,8 +29,8 @@ import (
 	"github.com/cloudflare/cloudflared/config"
 	"github.com/cloudflare/cloudflared/connection"
 	"github.com/cloudflare/cloudflared/credentials"
+	"github.com/cloudflare/cloudflared/diagnostic"
 	"github.com/cloudflare/cloudflared/edgediscovery"
-	"github.com/cloudflare/cloudflared/features"
 	"github.com/cloudflare/cloudflared/ingress"
 	"github.com/cloudflare/cloudflared/logger"
 	"github.com/cloudflare/cloudflared/management"
@@ -39,6 +40,7 @@ import (
 	"github.com/cloudflare/cloudflared/supervisor"
 	"github.com/cloudflare/cloudflared/tlsconfig"
 	"github.com/cloudflare/cloudflared/tunneldns"
+	"github.com/cloudflare/cloudflared/tunnelstate"
 	"github.com/cloudflare/cloudflared/validation"
 )
 
@@ -78,8 +80,8 @@ const (
 	// hostKeyPath is the path of the dir to save SSH host keys too
 	hostKeyPath = "host-key-path"
 
-	// udpUnregisterSessionTimeout is how long we wait before we stop trying to unregister a UDP session from the edge
-	udpUnregisterSessionTimeoutFlag = "udp-unregister-session-timeout"
+	// rpcTimeout is how long to wait for a Capnp RPC request to the edge
+	rpcTimeout = "rpc-timeout"
 
 	// writeStreamTimeout sets if we should have a timeout when writing data to a stream towards the destination (edge/origin).
 	writeStreamTimeout = "write-stream-timeout"
@@ -88,6 +90,14 @@ const (
 	// Packets will then be at most 1252 (IPv4) / 1232 (IPv6) bytes in size.
 	// Note that this may result in packet drops for UDP proxying, since we expect being able to send at least 1280 bytes of inner packets.
 	quicDisablePathMTUDiscovery = "quic-disable-pmtu-discovery"
+
+	// quicConnLevelFlowControlLimit controls the max flow control limit allocated for a QUIC connection. This controls how much data is the
+	// receiver willing to buffer. Once the limit is reached, the sender will send a DATA_BLOCKED frame to indicate it has more data to write,
+	// but it's blocked by flow control
+	quicConnLevelFlowControlLimit = "quic-connection-level-flow-control-limit"
+	// quicStreamLevelFlowControlLimit is similar to quicConnLevelFlowControlLimit but for each QUIC stream. When the sender is blocked,
+	// it will send a STREAM_DATA_BLOCKED frame
+	quicStreamLevelFlowControlLimit = "quic-stream-level-flow-control-limit"
 
 	// uiFlag is to enable launching cloudflared in interactive UI mode
 	uiFlag = "ui"
@@ -117,6 +127,94 @@ var (
 		"most likely you already have a conflicting record there. You can also rerun this command with --%s to overwrite "+
 		"any existing DNS records for this hostname.", overwriteDNSFlag)
 	deprecatedClassicTunnelErr = fmt.Errorf("Classic tunnels have been deprecated, please use Named Tunnels. (https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/tunnel-guide/)")
+	// TODO: TUN-8756 the list below denotes the flags that do not possess any kind of sensitive information
+	// however this approach is not maintainble in the long-term.
+	nonSecretFlagsList = []string{
+		"config",
+		"autoupdate-freq",
+		"no-autoupdate",
+		"metrics",
+		"pidfile",
+		"url",
+		"hello-world",
+		"socks5",
+		"proxy-connect-timeout",
+		"proxy-tls-timeout",
+		"proxy-tcp-keepalive",
+		"proxy-no-happy-eyeballs",
+		"proxy-keepalive-connections",
+		"proxy-keepalive-timeout",
+		"proxy-connection-timeout",
+		"proxy-expect-continue-timeout",
+		"http-host-header",
+		"origin-server-name",
+		"unix-socket",
+		"origin-ca-pool",
+		"no-tls-verify",
+		"no-chunked-encoding",
+		"http2-origin",
+		"management-hostname",
+		"service-op-ip",
+		"local-ssh-port",
+		"ssh-idle-timeout",
+		"ssh-max-timeout",
+		"bucket-name",
+		"region-name",
+		"s3-url-host",
+		"host-key-path",
+		"ssh-server",
+		"bastion",
+		"proxy-address",
+		"proxy-port",
+		"loglevel",
+		"transport-loglevel",
+		"logfile",
+		"log-directory",
+		"trace-output",
+		"proxy-dns",
+		"proxy-dns-port",
+		"proxy-dns-address",
+		"proxy-dns-upstream",
+		"proxy-dns-max-upstream-conns",
+		"proxy-dns-bootstrap",
+		"is-autoupdated",
+		"edge",
+		"region",
+		"edge-ip-version",
+		"edge-bind-address",
+		"cacert",
+		"hostname",
+		"id",
+		"lb-pool",
+		"api-url",
+		"metrics-update-freq",
+		"tag",
+		"heartbeat-interval",
+		"heartbeat-count",
+		"max-edge-addr-retries",
+		"retries",
+		"ha-connections",
+		"rpc-timeout",
+		"write-stream-timeout",
+		"quic-disable-pmtu-discovery",
+		"quic-connection-level-flow-control-limit",
+		"quic-stream-level-flow-control-limit",
+		"label",
+		"grace-period",
+		"compression-quality",
+		"use-reconnect-token",
+		"dial-edge-timeout",
+		"stdin-control",
+		"name",
+		"ui",
+		"quick-service",
+		"max-fetch-size",
+		"post-quantum",
+		"management-diagnostics",
+		"protocol",
+		"overwrite-dns",
+		"help",
+	}
 )
 
 func Flags() []cli.Flag {
@@ -131,11 +229,13 @@ func Commands() []*cli.Command {
 		buildVirtualNetworkSubcommand(false),
 		buildRunCommand(),
 		buildListCommand(),
+		buildReadyCommand(),
 		buildInfoCommand(),
 		buildIngressSubcommand(),
 		buildDeleteCommand(),
 		buildCleanupCommand(),
 		buildTokenCommand(),
+		buildDiagCommand(),
 		// for compatibility, allow following as tunnel subcommands
 		proxydns.Command(true),
 		cliutil.RemovedCommand("db-connect"),
@@ -287,7 +387,7 @@ func routeFromFlag(c *cli.Context) (route cfapi.HostnameRoute, ok bool) {
 func StartServer(
 	c *cli.Context,
 	info *cliutil.BuildInfo,
-	namedTunnel *connection.NamedTunnelProperties,
+	namedTunnel *connection.TunnelProperties,
 	log *zerolog.Logger,
 ) error {
 	err := sentry.Init(sentry.ClientOptions{
@@ -409,44 +509,69 @@ func StartServer(
 		}
 	}
 
-	internalRules := []ingress.Rule{}
-	if features.Contains(features.FeatureManagementLogs) {
-		serviceIP := c.String("service-op-ip")
-		if edgeAddrs, err := edgediscovery.ResolveEdge(log, tunnelConfig.Region, tunnelConfig.EdgeIPVersion); err == nil {
-			if serviceAddr, err := edgeAddrs.GetAddrForRPC(); err == nil {
-				serviceIP = serviceAddr.TCP.String()
-			}
-		}
-
-		mgmt := management.New(
-			c.String("management-hostname"),
-			c.Bool("management-diagnostics"),
-			serviceIP,
-			clientID,
-			c.String(connectorLabelFlag),
-			logger.ManagementLogger.Log,
-			logger.ManagementLogger,
-		)
-		internalRules = []ingress.Rule{ingress.NewManagementRule(mgmt)}
+	// Disable ICMP packet routing for quick tunnels
+	if quickTunnelURL != "" {
+		tunnelConfig.ICMPRouterServer = nil
 	}
+
+	serviceIP := c.String("service-op-ip")
+	if edgeAddrs, err := edgediscovery.ResolveEdge(log, tunnelConfig.Region, tunnelConfig.EdgeIPVersion); err == nil {
+		if serviceAddr, err := edgeAddrs.GetAddrForRPC(); err == nil {
+			serviceIP = serviceAddr.TCP.String()
+		}
+	}
+
+	mgmt := management.New(
+		c.String("management-hostname"),
+		c.Bool("management-diagnostics"),
+		serviceIP,
+		clientID,
+		c.String(connectorLabelFlag),
+		logger.ManagementLogger.Log,
+		logger.ManagementLogger,
+	)
+	internalRules := []ingress.Rule{ingress.NewManagementRule(mgmt)}
 	orchestrator, err := orchestration.NewOrchestrator(ctx, orchestratorConfig, tunnelConfig.Tags, internalRules, tunnelConfig.Log)
 	if err != nil {
 		return err
 	}
 
-	metricsListener, err := listeners.Listen("tcp", c.String("metrics"))
+	metricsListener, err := metrics.CreateMetricsListener(&listeners, c.String("metrics"))
 	if err != nil {
 		log.Err(err).Msg("Error opening metrics server listener")
 		return errors.Wrap(err, "Error opening metrics server listener")
 	}
+
 	defer metricsListener.Close()
 	wg.Add(1)
+
 	go func() {
 		defer wg.Done()
-		readinessServer := metrics.NewReadyServer(log, clientID)
-		observer.RegisterSink(readinessServer)
+		tracker := tunnelstate.NewConnTracker(log)
+		observer.RegisterSink(tracker)
+
+		ipv4, ipv6, err := determineICMPSources(c, log)
+		sources := make([]string, 0)
+		if err == nil {
+			sources = append(sources, ipv4.String())
+			sources = append(sources, ipv6.String())
+		}
+
+		readinessServer := metrics.NewReadyServer(clientID, tracker)
+		cliFlags := nonSecretCliFlags(log, c, nonSecretFlagsList)
+		diagnosticHandler := diagnostic.NewDiagnosticHandler(
+			log,
+			0,
+			diagnostic.NewSystemCollectorImpl(buildInfo.CloudflaredVersion),
+			tunnelConfig.NamedTunnel.Credentials.TunnelID,
+			clientID,
+			tracker,
+			cliFlags,
+			sources,
+		)
 		metricsConfig := metrics.Config{
 			ReadyServer:         readinessServer,
+			DiagnosticHandler:   diagnosticHandler,
 			QuickTunnelHostname: quickTunnelURL,
 			Orchestrator:        orchestrator,
 		}
@@ -658,9 +783,9 @@ func tunnelFlags(shouldHide bool) []cli.Flag {
 		}),
 		altsrc.NewStringSliceFlag(&cli.StringSliceFlag{
 			Name:    "tag",
-			Usage:   "Custom tags used to identify this tunnel, in format `KEY=VALUE`. Multiple tags may be specified",
+			Usage:   "Custom tags used to identify this tunnel via added HTTP request headers to the origin, in format `KEY=VALUE`. Multiple tags may be specified.",
 			EnvVars: []string{"TUNNEL_TAG"},
-			Hidden:  shouldHide,
+			Hidden:  true,
 		}),
 		altsrc.NewDurationFlag(&cli.DurationFlag{
 			Name:   "heartbeat-interval",
@@ -695,7 +820,7 @@ func tunnelFlags(shouldHide bool) []cli.Flag {
 			Hidden: true,
 		}),
 		altsrc.NewDurationFlag(&cli.DurationFlag{
-			Name:   udpUnregisterSessionTimeoutFlag,
+			Name:   rpcTimeout,
 			Value:  5 * time.Second,
 			Hidden: true,
 		}),
@@ -711,6 +836,20 @@ func tunnelFlags(shouldHide bool) []cli.Flag {
 			EnvVars: []string{"TUNNEL_DISABLE_QUIC_PMTU"},
 			Usage:   "Use this option to disable PTMU discovery for QUIC connections. This will result in lower packet sizes. Not however, that this may cause instability for UDP proxying.",
 			Value:   false,
+			Hidden:  true,
+		}),
+		altsrc.NewIntFlag(&cli.IntFlag{
+			Name:    quicConnLevelFlowControlLimit,
+			EnvVars: []string{"TUNNEL_QUIC_CONN_LEVEL_FLOW_CONTROL_LIMIT"},
+			Usage:   "Use this option to change the connection-level flow control limit for QUIC transport.",
+			Value:   30 * (1 << 20), // 30 MB
+			Hidden:  true,
+		}),
+		altsrc.NewIntFlag(&cli.IntFlag{
+			Name:    quicStreamLevelFlowControlLimit,
+			EnvVars: []string{"TUNNEL_QUIC_STREAM_LEVEL_FLOW_CONTROL_LIMIT"},
+			Usage:   "Use this option to change the connection-level flow control limit for QUIC transport.",
+			Value:   6 * (1 << 20), // 6 MB
 			Hidden:  true,
 		}),
 		altsrc.NewStringFlag(&cli.StringFlag{
@@ -829,9 +968,15 @@ func configureCloudflaredFlags(shouldHide bool) []cli.Flag {
 			Hidden:  shouldHide,
 		}),
 		altsrc.NewStringFlag(&cli.StringFlag{
-			Name:    "metrics",
-			Value:   "localhost:",
-			Usage:   "Listen address for metrics reporting.",
+			Name:  "metrics",
+			Value: metrics.GetMetricsDefaultAddress(metrics.Runtime),
+			Usage: fmt.Sprintf(
+				`Listen address for metrics reporting. If no address is passed cloudflared will try to bind to %v.
+If all are unavailable, a random port will be used. Note that when running cloudflared from an virtual
+environment the default address binds to all interfaces, hence, it is important to isolate the host
+and virtualized host network stacks from each other`,
+				metrics.GetMetricsKnownAddresses(metrics.Runtime),
+			),
 			EnvVars: []string{"TUNNEL_METRICS"},
 			Hidden:  shouldHide,
 		}),
@@ -1161,4 +1306,47 @@ reconnect [delay]
 			}
 		}
 	}
+}
+
+func nonSecretCliFlags(log *zerolog.Logger, cli *cli.Context, flagInclusionList []string) map[string]string {
+	flagsNames := cli.FlagNames()
+	flags := make(map[string]string, len(flagsNames))
+
+	for _, flag := range flagsNames {
+		value := cli.String(flag)
+
+		if value == "" {
+			continue
+		}
+
+		isIncluded := isFlagIncluded(flagInclusionList, flag)
+		if !isIncluded {
+			continue
+		}
+
+		switch flag {
+		case logger.LogDirectoryFlag, logger.LogFileFlag:
+			{
+				absolute, err := filepath.Abs(value)
+				if err != nil {
+					log.Error().Err(err).Msgf("could not convert %s path to absolute", flag)
+				} else {
+					flags[flag] = absolute
+				}
+			}
+		default:
+			flags[flag] = value
+		}
+	}
+	return flags
+}
+
+func isFlagIncluded(flagInclusionList []string, flag string) bool {
+	for _, include := range flagInclusionList {
+		if include == flag {
+			return true
+		}
+	}
+
+	return false
 }

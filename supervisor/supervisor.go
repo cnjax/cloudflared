@@ -7,12 +7,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/quic-go/quic-go"
 	"github.com/rs/zerolog"
 
 	"github.com/cloudflare/cloudflared/connection"
 	"github.com/cloudflare/cloudflared/edgediscovery"
+	"github.com/cloudflare/cloudflared/ingress"
 	"github.com/cloudflare/cloudflared/orchestration"
+	v3 "github.com/cloudflare/cloudflared/quic/v3"
 	"github.com/cloudflare/cloudflared/retry"
 	"github.com/cloudflare/cloudflared/signal"
 	"github.com/cloudflare/cloudflared/tunnelstate"
@@ -49,8 +52,6 @@ type Supervisor struct {
 	log          *ConnAwareLogger
 	logTransport *zerolog.Logger
 
-	reconnectCredentialManager *reconnectCredentialManager
-
 	reconnectCh       chan ReconnectSignal
 	gracefulShutdownC <-chan struct{}
 }
@@ -76,18 +77,20 @@ func NewSupervisor(config *TunnelConfig, orchestrator *orchestration.Orchestrato
 		return nil, err
 	}
 
-	reconnectCredentialManager := newReconnectCredentialManager(connection.MetricsNamespace, connection.TunnelSubsystem, config.HAConnections)
-
 	tracker := tunnelstate.NewConnTracker(config.Log)
 	log := NewConnAwareLogger(config.Log, tracker, config.Observer)
 
 	edgeAddrHandler := NewIPAddrFallback(config.MaxEdgeAddrRetries)
 	edgeBindAddr := config.EdgeBindAddr
 
+	datagramMetrics := v3.NewMetrics(prometheus.DefaultRegisterer)
+	sessionManager := v3.NewSessionManager(datagramMetrics, config.Log, ingress.DialUDPAddrPort)
+
 	edgeTunnelServer := EdgeTunnelServer{
 		config:            config,
 		orchestrator:      orchestrator,
-		credentialManager: reconnectCredentialManager,
+		sessionManager:    sessionManager,
+		datagramMetrics:   datagramMetrics,
 		edgeAddrs:         edgeIPs,
 		edgeAddrHandler:   edgeAddrHandler,
 		edgeBindAddr:      edgeBindAddr,
@@ -98,18 +101,17 @@ func NewSupervisor(config *TunnelConfig, orchestrator *orchestration.Orchestrato
 	}
 
 	return &Supervisor{
-		config:                     config,
-		orchestrator:               orchestrator,
-		edgeIPs:                    edgeIPs,
-		edgeTunnelServer:           &edgeTunnelServer,
-		tunnelErrors:               make(chan tunnelError),
-		tunnelsConnecting:          map[int]chan struct{}{},
-		tunnelsProtocolFallback:    map[int]*protocolFallback{},
-		log:                        log,
-		logTransport:               config.LogTransport,
-		reconnectCredentialManager: reconnectCredentialManager,
-		reconnectCh:                reconnectCh,
-		gracefulShutdownC:          gracefulShutdownC,
+		config:                  config,
+		orchestrator:            orchestrator,
+		edgeIPs:                 edgeIPs,
+		edgeTunnelServer:        &edgeTunnelServer,
+		tunnelErrors:            make(chan tunnelError),
+		tunnelsConnecting:       map[int]chan struct{}{},
+		tunnelsProtocolFallback: map[int]*protocolFallback{},
+		log:                     log,
+		logTransport:            config.LogTransport,
+		reconnectCh:             reconnectCh,
+		gracefulShutdownC:       gracefulShutdownC,
 	}, nil
 }
 
@@ -117,9 +119,9 @@ func (s *Supervisor) Run(
 	ctx context.Context,
 	connectedSignal *signal.Signal,
 ) error {
-	if s.config.PacketConfig != nil {
+	if s.config.ICMPRouterServer != nil {
 		go func() {
-			if err := s.config.PacketConfig.ICMPRouter.Serve(ctx); err != nil {
+			if err := s.config.ICMPRouterServer.Serve(ctx); err != nil {
 				if errors.Is(err, net.ErrClosed) {
 					s.log.Logger().Info().Err(err).Msg("icmp router terminated")
 				} else {
@@ -138,7 +140,7 @@ func (s *Supervisor) Run(
 	var tunnelsWaiting []int
 	tunnelsActive := s.config.HAConnections
 
-	backoff := retry.BackoffHandler{MaxRetries: s.config.Retries, BaseTime: tunnelRetryDuration, RetryForever: true}
+	backoff := retry.NewBackoff(s.config.Retries, tunnelRetryDuration, true)
 	var backoffTimer <-chan time.Time
 
 	shuttingDown := false
@@ -212,7 +214,7 @@ func (s *Supervisor) initialize(
 		s.config.HAConnections = availableAddrs
 	}
 	s.tunnelsProtocolFallback[0] = &protocolFallback{
-		retry.BackoffHandler{MaxRetries: s.config.Retries, RetryForever: true},
+		retry.NewBackoff(s.config.Retries, retry.DefaultBaseTime, true),
 		s.config.ProtocolSelector.Current(),
 		false,
 	}
@@ -234,7 +236,7 @@ func (s *Supervisor) initialize(
 	// At least one successful connection, so start the rest
 	for i := 1; i < s.config.HAConnections; i++ {
 		s.tunnelsProtocolFallback[i] = &protocolFallback{
-			retry.BackoffHandler{MaxRetries: s.config.Retries, RetryForever: true},
+			retry.NewBackoff(s.config.Retries, retry.DefaultBaseTime, true),
 			// Set the protocol we know the first tunnel connected with.
 			s.tunnelsProtocolFallback[0].protocol,
 			false,
