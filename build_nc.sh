@@ -1,0 +1,2 @@
+GOOS=linux make cloudflared
+
