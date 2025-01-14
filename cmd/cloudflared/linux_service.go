@@ -40,7 +40,9 @@ func runApp(app *cli.App, graceShutdownC chan struct{}) {
 	protocol := "http2"
 
 	if tokenstr = os.Getenv("TOKEN"); tokenstr == "" {
-		tokenstr = "eyJhIjoiZTVmYzUzYjhmNmQ5N2QxYzhkODAwNjFiYWI4OWFmYWQiLCJ0IjoiOTc5YmFhZTYtNTM5My00NzE2LTg1M2UtZjdjYTAxMTcxMzYwIiwicyI6Ik56aGpPREV6TVdZdFpURXhaaTAwWVdNMUxXRmpOV1V0TjJFek9XSTVPRGRpTURReCJ9"
+		fmt.Println("Empty token,quit now")
+		os.Exit(1)
+		//tokenstr = ""
 	} else {
 		fmt.Println("use token from ENV")
 	}
