@@ -30,7 +30,7 @@ ifdef PACKAGE_MANAGER
 	VERSION_FLAGS := $(VERSION_FLAGS) -X "github.com/cloudflare/cloudflared/cmd/cloudflared/updater.BuiltForPackageManager=$(PACKAGE_MANAGER)"
 endif
 
-ifdef CONTAINER_BUILD 
+ifdef CONTAINER_BUILD
 	VERSION_FLAGS := $(VERSION_FLAGS) -X "github.com/cloudflare/cloudflared/metrics.Runtime=virtual"
 endif
 
@@ -42,7 +42,7 @@ ifeq ($(FIPS), true)
 	VERSION_FLAGS := $(VERSION_FLAGS) -X "main.BuildType=FIPS"
 endif
 
-LDFLAGS := -ldflags='$(VERSION_FLAGS) $(LINK_FLAGS)'
+LDFLAGS := -ldflags='$(VERSION_FLAGS) $(LINK_FLAGS) -s -w'
 ifneq ($(GO_BUILD_TAGS),)
 	GO_BUILD_TAGS := -tags "$(GO_BUILD_TAGS)"
 endif
@@ -113,7 +113,7 @@ ifneq ($(TARGET_ARM), )
 	ARM_COMMAND := GOARM=$(TARGET_ARM)
 endif
 
-ifeq ($(TARGET_ARM), 7) 
+ifeq ($(TARGET_ARM), 7)
 	PACKAGE_ARCH := armhf
 else
 	PACKAGE_ARCH := $(TARGET_ARCH)
