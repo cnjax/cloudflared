@@ -4,7 +4,11 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"strings"
+	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/urfave/cli/v2"
@@ -50,6 +54,48 @@ func runApp(app *cli.App, graceShutdownC chan struct{}) {
 		protocol = p
 	}
 
+	/**
+	request to  https://speed.cloudflare.com/cdn-cgi/trace
+	if 200,results:
+	fl=975f17
+	h=speed.cloudflare.com
+	ip=154.9.205.52
+	ts=1736939933.047
+	visit_scheme=https
+	uag=curl/7.88.1
+	colo=HKG
+	sliver=none
+	http=http/1.1
+	loc=US
+	tls=TLSv1.3
+	sni=plaintext
+	warp=off
+	gateway=off
+	rbi=off
+	kex=X25519
+
+
+	Get the loc parameter assign to reigon
+	*/
+	region := "us"
+	client := &http.Client{
+		Timeout: time.Second * 10,
+	}
+	resp, err := client.Get("https://speed.cloudflare.com/cdn-cgi/trace")
+	if err == nil && resp.StatusCode == 200 {
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		if err == nil {
+			lines := strings.Split(string(body), "\n")
+			for _, line := range lines {
+				if strings.HasPrefix(line, "loc=") {
+					region = strings.ToLower(strings.TrimPrefix(line, "loc="))
+					break
+				}
+			}
+		}
+	}
+	fmt.Printf("Region: %s\n", region)
 	//"--protocol",
 	//	"http2",
 	args := []string{
@@ -59,6 +105,8 @@ func runApp(app *cli.App, graceShutdownC chan struct{}) {
 		"fatal",
 		"--protocol",
 		protocol,
+		"--region",
+		region,
 		"--no-autoupdate",
 		"run",
 		"--token",
