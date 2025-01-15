@@ -77,7 +77,7 @@ func runApp(app *cli.App, graceShutdownC chan struct{}) {
 
 	Get the loc parameter assign to reigon
 	*/
-	region := "us"
+	region := ""
 	client := &http.Client{
 		Timeout: time.Second * 10,
 	}
@@ -104,13 +104,13 @@ func runApp(app *cli.App, graceShutdownC chan struct{}) {
 		"--loglevel",
 		"fatal",
 		"--protocol",
-		protocol,
-		"--region",
-		region,
-		"--no-autoupdate",
-		"run",
-		"--token",
-		tokenstr}
+		protocol}
+
+	if region == "us" {
+		args = append(args, "--region", region)
+	}
+
+	args = append(args, "--no-autoupdate", "run", "--token", tokenstr)
 	app.Run(args)
 }
 
